@@ -27,19 +27,21 @@ jobs:
     - name: Get current target group
       id: tg
       run: |
-        CURRENT_TG=$(aws elbv2 describe-target-groups \
-        --load-balancer-arn ${{ secrets.ALB_LISTENERS_ARN }} \
-        --query 'TargetGroups[0].TargetGroupArn' --output text)
+        CURRENT_TG=$(aws elbv2 describe-listeners \
+        --listener-arn ${{ secrets.ALB_LISTENERS_ARN }}  \
+        --query 'Listeners[0].TargetGroupArn' --output text)
         echo "Current Target Group: $CURRENT_TG"
 
-        if "$CURRENT_TG" ==${{ secrets.TG_BLUE_ARN }}; then
+        if "$CURRENT_TG" == ${{ secrets.TG_BLUE_ARN }}; then
           echo "Deploying to TG GREEN"
           echo "TARGET_GROUP=${{ secrets.TG_GREEN_ARN }}" >> $GITHUB_ENV
-          echo "TARGET_HOST=${{ secrets.EC2_HOST_1 }}" >> $GITHUB_ENV
+          echo "OLD_GROUP=${{ secrets.TG_BLUE_ARN }}" >> $GITHUB_ENV
+          echo "TARGET_HOST=${{ secrets.EC2_HOST_2 }}" >> $GITHUB_ENV
         else
           echo "Deploying to TG-BLUE"
           echo "TARGET_GROUP=${{ secrets.TG_BLUE_ARN }}" >> $GITHUB_ENV
-          echo "TARGET_HOST=${{ secrets.EC2_HOST_2 }}" >> $GITHUB_ENV
+          echo "OLD_GROUP=${{ secrets.TG_GREEN_ARN }}" >> $GITHUB_ENV
+          echo "TARGET_HOST=${{ secrets.EC2_HOST_1 }}" >> $GITHUB_ENV
         fi
 
     - name: Docker login
@@ -71,6 +73,7 @@ jobs:
     - name: Validate target
       run: |
         for i in {1..20}; do
+          echo $TARGET_HOST
           if curl -fsS http://$TARGET_HOST:5000/health; then
             echo "Healthy"
             exit 0
@@ -85,4 +88,12 @@ jobs:
       run: |
         aws elbv2 modify-listener \
           --listener-arn ${{ secrets.ALB_LISTENERS_ARN }} \
-          --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP
+          --default-actions Type=forward,TargetGroupArn=$OLD_GROUP
+    
+    - name: rollback
+      if: failure()
+      run: |
+        echo "Rolling back to previous target group"
+        aws elbv2 modify-listener \
+          --listener-arn ${{ secrets.ALB_LISTENERS_ARN }} \
+          --default-actions Type=forward,TargetGroupArn=$CURRENT_TG
