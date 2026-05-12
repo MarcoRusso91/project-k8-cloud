@@ -1,0 +1,88 @@
+name: Rolling deploy to EC2 - ALB
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy-alb:
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE: ${{ secrets.DOCKER_USER }}/flask-app-x:${{ github.sha }}
+
+    steps:  
+    - name: Checkout code
+      uses: actions/checkout@v2
+    
+
+    - name : configure AWS
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCES_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Get current target group
+      id: tg
+      run: |
+        CURRENT_TG=$(aws elbv2 describe-target-groups \
+        --load-balancer-arn ${{ secrets.ALB_LISTENERS_ARN }} \
+        --query 'TargetGroups[0].TargetGroupArn' --output text)
+        echo "Current Target Group: $CURRENT_TG"
+
+        if "$CURRENT_TG" ==${{ secrets.TG_BLUE_ARN }}; then
+          echo "Deploying to TG GREEN"
+          echo "TARGET_GROUP=${{ secrets.TG_GREEN_ARN }}" >> $GITHUB_ENV
+          echo "TARGET_HOST=${{ secrets.EC2_HOST_1 }}" >> $GITHUB_ENV
+        else
+          echo "Deploying to TG-BLUE"
+          echo "TARGET_GROUP=${{ secrets.TG_BLUE_ARN }}" >> $GITHUB_ENV
+          echo "TARGET_HOST=${{ secrets.EC2_HOST_2 }}" >> $GITHUB_ENV
+        fi
+
+    - name: Docker login
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USER }}
+        password: ${{ secrets.DOCKER_PASS }}
+
+    - name: Build image
+      run: |
+        docker build -t $IMAGE .
+        docker push $IMAGE
+
+    - name: Deploy inactive environment
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ env.TARGET_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_KEY }}
+        script: |
+          IMAGE="${{ secrets.DOCKER_USER }}/flask-app-x:${{ github.sha }}"
+
+          docker pull $IMAGE
+          docker stop app || true
+          docker rm app || true
+
+          docker run -d -p 5000:5000 --name app $IMAGE
+
+    - name: Validate target
+      run: |
+        for i in {1..20}; do
+          if curl -fsS http://$TARGET_HOST:5000/health; then
+            echo "Healthy"
+            exit 0
+          fi
+          sleep 5
+        done
+
+        echo "Deployment failed"
+        exit 1 
+
+    - name: Switch ALB traffic
+      run: |
+        aws elbv2 modify-listener \
+          --listener-arn ${{ secrets.ALB_LISTENERS_ARN }} \
+          --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP
